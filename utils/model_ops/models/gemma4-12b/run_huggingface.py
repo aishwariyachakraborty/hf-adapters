@@ -16,8 +16,8 @@ import os
 
 import torch
 from transformers import (
-    Mistral3ForConditionalGeneration,
-    MistralCommonBackend,
+    AutoModelForMultimodalLM,
+    AutoProcessor,
     StaticCache,
 )
 from utils.torchop_yaml import TorchOpCollector, require_cuda, setup_logging
@@ -27,7 +27,7 @@ def main():
     setup_logging()
     require_cuda()
 
-    model_path = "mistralai/Ministral-3-14B-Instruct-2512"
+    model_path = "google/gemma-4-12B-it"
 
     messages = [
         {
@@ -42,15 +42,20 @@ def main():
     ]
 
     device = "cuda"
-    model = Mistral3ForConditionalGeneration.from_pretrained(
+    model = AutoModelForMultimodalLM.from_pretrained(
         model_path,
         device_map=device,
         torch_dtype=torch.bfloat16,
         trust_remote_code=False,
     )
-    tokenizer = MistralCommonBackend.from_pretrained(model_path)
+    tokenizer = AutoProcessor.from_pretrained(model_path)
     encoded_input = tokenizer.apply_chat_template(
-        messages, return_tensors="pt", return_dict=True
+        messages,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        add_generation_prompt=True,
+        enable_thinking=False,
     ).to(device)
     input_ids = encoded_input["input_ids"]
     batch, input_len = input_ids.shape[0], input_ids.shape[-1]
