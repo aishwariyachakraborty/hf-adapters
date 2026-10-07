@@ -222,7 +222,9 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  batch            : {args.batch}")
         print(f"  dtype            : {args.dtype or '(not set — model default)'}")
         print(f"  Prompt File      : {args.prompt_file}")
-        print(f"  Profiling        : {args.trace_dir if args.with_profiling else 'off'}")
+        print(
+            f"  Profiling        : {args.trace_dir if args.with_profiling else 'off'}"
+        )
         print("=" * 70)
 
     if args.prompt_file is not None:
