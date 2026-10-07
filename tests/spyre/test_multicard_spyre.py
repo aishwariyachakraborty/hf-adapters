@@ -338,7 +338,9 @@ def run_multicard_smoke_test(
         print(f"\n{'=' * 20} Run Model... (run {run_idx + 1}/{num_iterations})")
         gen_t0 = time.time()
         try:
-            with generate_ctx() if generate_ctx is not None else contextlib.nullcontext():
+            with (
+                generate_ctx() if generate_ctx is not None else contextlib.nullcontext()
+            ):
                 output_texts, captured = _run_generate()
                 # Inside the ctx so gen_s excludes e.g. profiler trace export on exit.
                 result["gen_s"] = time.time() - gen_t0
