@@ -55,7 +55,9 @@ every run — useful for consistent latency benchmarking::
 Pass ``--with-profiling`` to wrap the timed generate call in
 ``torch.profiler.profile`` (CPU + PrivateUse1 activities, shapes, memory).
 Model load, torch.compile and the warmup generate run before the profiler
-starts, so the trace covers steady-state generation only.  Each rank writes a
+starts, so the trace covers steady-state generation only.  With ``--batch 1``
+the profiler steps once per generated token and drops the first token
+(prefill) as a warmup step, so the trace holds decode tokens only.  Each rank writes a
 TensorBoard trace to ``--trace-dir`` (one ``<hostname>_<pid>.pt.trace.json``
 per rank); view with ``tensorboard --logdir`` or https://ui.perfetto.dev.
 Profiling adds overhead, so TTFT / ITL from a profiled run are not comparable
@@ -81,6 +83,21 @@ That SIGTERM goes to the ranks that were still running; torchrun stops the
 whole gang once any rank exits nonzero. It is the result of the failure, never
 the cause -- read the RESULTS SUMMARY above it for the real verdict.
 
+Set ``FLEX_CB_TIMELINE_FILE`` to record flex's per-control-block arrival dump
+(``FLEX_CB_TIMELINE_MODE=cb|batch``). The script flushes it on every rank just
+before exiting, because the ``os._exit`` below skips the exit-time write. Each
+rank writes ``<path>.<pid>``; the directory must exist::
+
+    mkdir -p /tmp/cb_timeline
+    export FLEX_CB_TIMELINE_FILE=/tmp/cb_timeline/cb.csv
+    torchrun --nproc-per-node=2 --master-port=29500 \\
+        scripts/run_multicard_smoke.py --dtype float16
+
+Note: a ``corrupted double-linked list`` / SIGABRT crash may appear after the
+RESULTS SUMMARY prints.  This is a known shutdown bug in the Spyre runtime
+(libsenlib-dd2.so destructors) and does not affect correctness — if the
+summary shows ``Status: PASS`` the test passed.
+
 Before exiting, the script calls ``dist.destroy_process_group()``. Once
 torch-spyre#6009 lands, this calls ``SpyreCCLBackend::shutdown()`` and so
 ``spyre_comms::finalize_library()``; until then ``shutdown()`` is an empty
@@ -95,6 +112,7 @@ If the exit barrier fails (a peer rank is gone), the script skips both
 ``destroy_process_group()`` and interpreter teardown and exits via
 ``os._exit()`` with the verdict's exit code, since either could hang in
 ``finalize_library()``'s own barrier.
+
 """
 
 import argparse
@@ -202,6 +220,25 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }
+
+
+def _flush_cb_dump(local_rank: int) -> None:
+    """Write flex's CB dump (FLEX_CB_TIMELINE_FILE) now.
+
+    The os._exit() at the end of main() skips the dump's exit-time write.
+    """
+    if not os.environ.get("FLEX_CB_TIMELINE_FILE"):
+        return
+    try:
+        # No synchronize needed: flex records a CB just before its completion
+        # callback, and the test already waited on the run's results.
+        import torch_spyre
+
+        rows = torch_spyre._C.flush_cb_dump()
+        sys.stdout.write(f"[rank {local_rank}] CB dump: flushed {rows} rows\n")
+    except Exception as e:  # pragma: no cover - diagnostics only, never fail the run
+        sys.stdout.write(f"[rank {local_rank}] CB dump flush failed: {e}\n")
+    sys.stdout.flush()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -355,6 +392,7 @@ def main(argv: list[str] | None = None) -> None:
             sys.stdout.write(f"\n[rank {local_rank}] exit barrier skipped: {e}\n")
             sys.stdout.flush()
 
+
     # If the exit barrier failed, a peer is likely gone. Both an explicit
     # destroy_process_group() and normal interpreter teardown (which releases the
     # backend and runs its destructor -> finalize_library(), with its own
@@ -377,9 +415,8 @@ def main(argv: list[str] | None = None) -> None:
                 f"\n[rank {local_rank}] destroy_process_group failed: {e}\n"
             )
             sys.stdout.flush()
-
+    _flush_cb_dump(local_rank)
     sys.exit(1 if failed else 0)
-
 
 if __name__ == "__main__":
     main()
