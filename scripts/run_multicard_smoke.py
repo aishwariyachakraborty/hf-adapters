@@ -55,7 +55,9 @@ every run — useful for consistent latency benchmarking::
 Pass ``--with-profiling`` to wrap the timed generate call in
 ``torch.profiler.profile`` (CPU + PrivateUse1 activities, shapes, memory).
 Model load, torch.compile and the warmup generate run before the profiler
-starts, so the trace covers steady-state generation only.  Each rank writes a
+starts, so the trace covers steady-state generation only.  With ``--batch 1``
+the profiler steps once per generated token and drops the first token
+(prefill) as a warmup step, so the trace holds decode tokens only.  Each rank writes a
 TensorBoard trace to ``--trace-dir`` (one ``<hostname>_<pid>.pt.trace.json``
 per rank); view with ``tensorboard --logdir`` or https://ui.perfetto.dev.
 Profiling adds overhead, so TTFT / ITL from a profiled run are not comparable
@@ -95,6 +97,16 @@ If the exit barrier fails (a peer rank is gone), the script skips both
 ``destroy_process_group()`` and interpreter teardown and exits via
 ``os._exit()`` with the verdict's exit code, since either could hang in
 ``finalize_library()``'s own barrier.
+
+Set ``FLEX_CB_TIMELINE_FILE`` to record flex's per-control-block arrival dump
+(``FLEX_CB_TIMELINE_MODE=cb|batch``). The script flushes it on every rank just
+before exiting, because the ``os._exit()`` path below skips the exit-time
+write. Each rank writes ``<path>.<pid>``; the directory must exist::
+
+    mkdir -p /tmp/cb_timeline
+    export FLEX_CB_TIMELINE_FILE=/tmp/cb_timeline/cb.csv
+    torchrun --nproc-per-node=2 --master-port=29500 \\
+        scripts/run_multicard_smoke.py --dtype float16
 """
 
 import argparse
@@ -202,6 +214,26 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }
+
+
+def _flush_cb_dump(local_rank: int) -> None:
+    """Write flex's CB dump (FLEX_CB_TIMELINE_FILE) now.
+
+    The os._exit() path in main() (exit barrier failed) skips the dump's
+    exit-time write; flushing explicitly also covers the normal exit path.
+    """
+    if not os.environ.get("FLEX_CB_TIMELINE_FILE"):
+        return
+    try:
+        # No synchronize needed: flex records a CB just before its completion
+        # callback, and the test already waited on the run's results.
+        import torch_spyre
+
+        rows = torch_spyre._C.flush_cb_dump()
+        sys.stdout.write(f"[rank {local_rank}] CB dump: flushed {rows} rows\n")
+    except Exception as e:  # pragma: no cover - diagnostics only, never fail the run
+        sys.stdout.write(f"[rank {local_rank}] CB dump flush failed: {e}\n")
+    sys.stdout.flush()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -354,6 +386,8 @@ def main(argv: list[str] | None = None) -> None:
             barrier_ok = False
             sys.stdout.write(f"\n[rank {local_rank}] exit barrier skipped: {e}\n")
             sys.stdout.flush()
+
+    _flush_cb_dump(local_rank)
 
     # If the exit barrier failed, a peer is likely gone. Both an explicit
     # destroy_process_group() and normal interpreter teardown (which releases the
