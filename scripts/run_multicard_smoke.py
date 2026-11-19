@@ -55,7 +55,9 @@ every run — useful for consistent latency benchmarking::
 Pass ``--with-profiling`` to wrap the timed generate call in
 ``torch.profiler.profile`` (CPU + PrivateUse1 activities, shapes, memory).
 Model load, torch.compile and the warmup generate run before the profiler
-starts, so the trace covers steady-state generation only.  Each rank writes a
+starts, so the trace covers steady-state generation only.  With ``--batch 1``
+the profiler steps once per generated token and drops the first token
+(prefill) as a warmup step, so the trace holds decode tokens only.  Each rank writes a
 TensorBoard trace to ``--trace-dir`` (one ``<hostname>_<pid>.pt.trace.json``
 per rank); view with ``tensorboard --logdir`` or https://ui.perfetto.dev.
 Profiling adds overhead, so TTFT / ITL from a profiled run are not comparable
@@ -80,6 +82,16 @@ only thing printed after the summary is the elastic agent's teardown:
 That SIGTERM goes to the ranks that were still running; torchrun stops the
 whole gang once any rank exits nonzero. It is the result of the failure, never
 the cause -- read the RESULTS SUMMARY above it for the real verdict.
+
+Set ``FLEX_CB_TIMELINE_FILE`` to record flex's per-control-block arrival dump
+(``FLEX_CB_TIMELINE_MODE=cb|batch``). The script flushes it on every rank just
+before exiting, because the ``os._exit`` below skips the exit-time write. Each
+rank writes ``<path>.<pid>``; the directory must exist::
+
+    mkdir -p /tmp/cb_timeline
+    export FLEX_CB_TIMELINE_FILE=/tmp/cb_timeline/cb.csv
+    torchrun --nproc-per-node=2 --master-port=29500 \\
+        scripts/run_multicard_smoke.py --dtype float16
 
 Note: a ``corrupted double-linked list`` / SIGABRT crash may appear after the
 RESULTS SUMMARY prints.  This is a known shutdown bug in the Spyre runtime
@@ -192,6 +204,25 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }
+
+
+def _flush_cb_dump(local_rank: int) -> None:
+    """Write flex's CB dump (FLEX_CB_TIMELINE_FILE) now.
+
+    The os._exit() at the end of main() skips the dump's exit-time write.
+    """
+    if not os.environ.get("FLEX_CB_TIMELINE_FILE"):
+        return
+    try:
+        # No synchronize needed: flex records a CB just before its completion
+        # callback, and the test already waited on the run's results.
+        import torch_spyre
+
+        rows = torch_spyre._C.flush_cb_dump()
+        sys.stdout.write(f"[rank {local_rank}] CB dump: flushed {rows} rows\n")
+    except Exception as e:  # pragma: no cover - diagnostics only, never fail the run
+        sys.stdout.write(f"[rank {local_rank}] CB dump flush failed: {e}\n")
+    sys.stdout.flush()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -342,6 +373,8 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as e:  # pragma: no cover - teardown best effort
             sys.stdout.write(f"\n[rank {local_rank}] exit barrier skipped: {e}\n")
             sys.stdout.flush()
+
+    _flush_cb_dump(local_rank)
 
     # os._exit (not sys.exit) is deliberate: it skips interpreter teardown and
     # so avoids the libsenlib-dd2.so destructor SIGABRT described in the module
