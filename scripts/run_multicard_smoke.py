@@ -52,20 +52,34 @@ every run — useful for consistent latency benchmarking::
         scripts/run_multicard_smoke.py --dtype float16 \\
         --max-new-tokens 256 --min-new-tokens 256
 
-Pass ``--with-profiling`` to wrap the timed generate call in
-``torch.profiler.profile`` (CPU + PrivateUse1 activities, shapes, memory).
-Model load, torch.compile and the warmup generate run before the profiler
-starts, so the trace covers steady-state generation only.  With ``--batch 1``
-the profiler steps once per generated token and drops the first token
-(prefill) as a warmup step, so the trace holds decode tokens only.  Each rank writes a
-TensorBoard trace to ``--trace-dir`` (one ``<hostname>_<pid>.pt.trace.json``
-per rank); view with ``tensorboard --logdir`` or https://ui.perfetto.dev.
-Profiling adds overhead, so TTFT / ITL from a profiled run are not comparable
-to an unprofiled one::
+Pass ``--with-profiling`` to record the timed generate runs with
+``torch.profiler.profile`` (CPU + PrivateUse1 activities, shapes).  Model
+load, torch.compile and the warmup generate run before the profiler starts,
+so the trace covers steady-state generation only.  One profiler covers all
+``--iterations`` runs, and each rank writes one Chrome trace,
+``<trace-dir>/trace_rank<RANK>_pid<PID>.json``; view it at
+https://ui.perfetto.dev.  Setting ``STA_TRACE_DIR`` turns profiling on and
+uses that directory, which is what the spyre-trace-analyser expects of a
+re-runnable workload.
 
-    export SPYRE_DEVICES=0
-    torchrun --nproc-per-node=1 --master-port=29500 \\
+With ``--batch 1`` each generate step is marked with a ``record_function``
+span: ``p<RR>/ttft`` for prefill (up to the first token) and
+``p<RR>/itl_<NNNN>`` for each decode step, where ``RR`` is the run index.
+spyre-trace-analyser reads these as its steps, and needs at least 5 per
+phase: use ``--iterations 5`` or more for prefill, and force a fixed length
+with ``--min-new-tokens`` equal to ``--max-new-tokens`` for decode.  With
+``--batch`` > 1 the steps are not marked, because generate only accepts a
+streamer at batch size 1.
+
+Set ``FLEX_TIMESTAMP_CALIBRATION=always`` so device timestamps are calibrated
+rather than estimated.  Profiling adds overhead, so TTFT / ITL from a
+profiled run are not comparable to an unprofiled one::
+
+    export SPYRE_DEVICES=0,1
+    export FLEX_TIMESTAMP_CALIBRATION=always
+    torchrun --nproc-per-node=2 --master-port=29500 \\
         scripts/run_multicard_smoke.py --dtype float16 \\
+        --max-new-tokens 16 --min-new-tokens 16 --iterations 5 \\
         --with-profiling --trace-dir ./spyre_traces
 
 The --model argument accepts any HuggingFace repo ID or local path
@@ -115,6 +129,8 @@ import sys
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
+from transformers.generation.streamers import BaseStreamer
 
 # Ensure the project root (parent of scripts/) is on sys.path so that
 # tests.spyre.test_multicard_spyre can be imported when running directly
@@ -188,16 +204,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--with-profiling",
         action="store_true",
         help=(
-            "Profile the timed generate call with torch.profiler "
-            "(load, compile and warmup excluded)."
+            "Profile the timed generate runs with torch.profiler "
+            "(load, compile and warmup excluded).  Also on when "
+            "STA_TRACE_DIR is set."
         ),
     )
     parser.add_argument(
         "--trace-dir",
         default=DEFAULT_TRACE_DIR,
         help=(
-            "Directory for TensorBoard profiler traces, used with "
-            f"--with-profiling (default: {DEFAULT_TRACE_DIR})."
+            "Directory for the per-rank Chrome traces, used with "
+            f"--with-profiling (default: {DEFAULT_TRACE_DIR}).  "
+            "STA_TRACE_DIR overrides it."
         ),
     )
     return parser
@@ -214,6 +232,43 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }
+
+
+class _StepAnnotator(BaseStreamer):
+    """Mark each generate step with a ``record_function`` span.
+
+    generate() calls put() once with the prompt, then once per selected
+    token, then end().  So the prefill span runs from the prompt to the first
+    token, and decode span N from token N to token N+1.  No span is opened
+    after the last token of the budget, so a forced-length run has no empty
+    trailing step.
+    """
+
+    def __init__(self, prefix: str, max_new_tokens: int) -> None:
+        self._prefix = prefix
+        self._max_new_tokens = max_new_tokens
+        self._tokens = -1  # the first put() is the prompt
+        self._span: record_function | None = None
+
+    def _close(self) -> None:
+        if self._span is not None:
+            self._span.__exit__(None, None, None)
+            self._span = None
+
+    def put(self, value: torch.Tensor) -> None:
+        self._close()
+        self._tokens += 1
+        if self._tokens == 0:
+            leaf = "ttft"
+        elif self._tokens < self._max_new_tokens:
+            leaf = f"itl_{self._tokens:04d}"
+        else:
+            return
+        self._span = record_function(f"{self._prefix}/{leaf}")
+        self._span.__enter__()
+
+    def end(self) -> None:
+        self._close()
 
 
 def _flush_cb_dump(local_rank: int) -> None:
@@ -238,6 +293,10 @@ def _flush_cb_dump(local_rank: int) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    sta_trace_dir = os.environ.get("STA_TRACE_DIR")
+    if sta_trace_dir:
+        args.with_profiling = True
+        args.trace_dir = sta_trace_dir
     if args.dtype is not None:
         if args.dtype not in _DTYPE_MAP:
             raise ValueError(
@@ -288,19 +347,47 @@ def main(argv: list[str] | None = None) -> None:
     else:
         prompt = DEFAULT_PROMPT
 
-    generate_ctx = None
+    timed_runs_ctx = None
+    streamer_factory = None
     if args.with_profiling:
         from torch.profiler import ProfilerActivity, profile
 
-        def generate_ctx():
+        rank = int(os.environ.get("RANK", local_rank))
+
+        def _export_trace(prof) -> None:
+            os.makedirs(args.trace_dir, exist_ok=True)
+            path = os.path.join(
+                args.trace_dir, f"trace_rank{rank}_pid{os.getpid()}.json"
+            )
+            prof.export_chrome_trace(path)
+            sys.stdout.write(f"[rank {local_rank}] trace written: {path}\n")
+            sys.stdout.flush()
+
+        def timed_runs_ctx():
             # Exits (and on_trace_ready fires) inside run_multicard_smoke_test,
             # well before the process group is destroyed below.
             return profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
                 record_shapes=True,
-                profile_memory=True,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(args.trace_dir),
+                on_trace_ready=_export_trace,
             )
+
+        if args.batch == 1:
+
+            def streamer_factory(run_idx: int) -> _StepAnnotator:
+                return _StepAnnotator(f"p{run_idx:02d}", args.max_new_tokens)
+
+        if is_rank0:
+            if args.batch != 1:
+                print(
+                    "  NOTE: --batch > 1, so generate steps are not annotated; "
+                    "the trace analyser needs --batch 1 to find ttft/itl steps."
+                )
+            if os.environ.get("FLEX_TIMESTAMP_CALIBRATION") != "always":
+                print(
+                    "  NOTE: FLEX_TIMESTAMP_CALIBRATION is not 'always'; device "
+                    "timestamps may be estimated and fail the analyser's checks."
+                )
 
     result = run_multicard_smoke_test(
         args.model,
@@ -310,7 +397,8 @@ def main(argv: list[str] | None = None) -> None:
         batch_size=args.batch,
         prompt=prompt,
         num_iterations=args.iterations,
-        generate_ctx=generate_ctx,
+        timed_runs_ctx=timed_runs_ctx,
+        streamer_factory=streamer_factory,
     )
 
     # ── Summary table ──────────────────────────────────────────────────────

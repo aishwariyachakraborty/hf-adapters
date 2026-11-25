@@ -2403,6 +2403,8 @@ def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim,
             1,  # elems per stick
         ],
         device_dtype=get_device_dtype(dtype),
+        # Valid host elements per device-dim group: head_dim spans the
+        # stick-count and elems-per-stick dims (2, 4).
         valid_elements={
             (0,): max_cache_len,
             (1,): num_kv_heads,
